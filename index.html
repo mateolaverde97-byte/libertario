@@ -528,21 +528,40 @@ if(!S.recUp) S.recUp={}; if(!S.folders) S.folders={};
 try{ if(window.claude&&claude.use) claude.use('mcp').then(m=>{ CAP.mcp=m; if(route==='finanzas'||route==='informes') render(); }).catch(()=>{}); }catch(e){}
 setInterval(()=>{ if(CAP.mcp&&!document.hidden) syncExt(false); },180000);
 let DSYNC={busy:false,done:0,total:0,last:null};
-function pendingRecibos(){ const seen=new Set(), out=[];
-  for(const m of S.movs) for(const r of (m.recibos||[])){ if(seen.has(r.id)) continue; seen.add(r.id); if(!S.recUp[r.id]||!S.recUp[r.id].id) out.push({r,m}); }
+/* Un recibo = un archivo, aunque cubra varios movimientos o materiales. Va a la carpeta de la partida del primer gasto que lo usa
+   (si no hay gasto, a la partida de origen de la transferencia o entrega). */
+function recDest(id){
+  let first=null, best=null, bp=null, lvl=9;
+  for(const m of S.movs){ if(!(m.recibos||[]).some(r=>r.id===id)) continue; if(!first) first=m;
+    const c = m.type==='gasto'&&PART[m.part] ? [1,PART[m.part]] : PART[m.pFrom] ? [2,PART[m.pFrom]] : PART[m.part] ? [3,PART[m.part]] : null;
+    if(c&&c[0]<lvl){ lvl=c[0]; bp=c[1]; best=m; } }
+  return first?{m:best||first,p:bp,n:S.movs.filter(m=>(m.recibos||[]).some(r=>r.id===id)).length}:null; }
+function allRecibos(){ const seen=new Set(), out=[];
+  for(const m of S.movs) for(const r of (m.recibos||[])){ if(seen.has(r.id)) continue; seen.add(r.id); const d=recDest(r.id); out.push({r,m:d.m,p:d.p}); }
   return out; }
+function pendingRecibos(){ return allRecibos().filter(x=>!S.recUp[x.r.id]||!S.recUp[x.r.id].id); }
+const fsafe=t=>String(t).replace(/[\\/:*?"<>|#\n]+/g,' ').replace(/\s+/g,' ').trim();
+function catFolderName(c){ return fsafe((CATS_ORDER.indexOf(c)+1)+' · '+c); }
+function partFolderName(p){ const k=D.PART.filter(x=>x.cat===p.cat).indexOf(p)+1; return fsafe((CATS_ORDER.indexOf(p.cat)+1)+'.'+k+' · '+p.n); }
+function recPath(p){ return p?catFolderName(p.cat)+'/'+partFolderName(p):'99 · Otros movimientos'; }
 function waitingRecibos(){ return S.qlist.filter(q=>!q.movId).reduce((n,q)=>n+(q.recibos||[]).length,0); }
-function recCat(m){ return m.type==='gasto' && PART[m.part] ? PART[m.part].cat : null; }
 const DSERVER='Google Drive';
 async function dcall(tool,input){ const r=await CAP.mcp.callTool(DSERVER,tool,input); return r.payload!==undefined?r.payload:r; }
-async function ensureFolder(cat){
-  if(!cat) return DRIVE.otros; if(DRIVE.cats[cat]) return DRIVE.cats[cat]; if(S.folders[cat]) return S.folders[cat];
-  const q=`title = '${cat.replace(/'/g,"\\'")}' and parentId = '${DRIVE.root}' and mimeType = 'application/vnd.google-apps.folder'`;
+async function findOrMake(title,parent){
+  const q=`title = '${title.replace(/'/g,"\\'")}' and parentId = '${parent}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
   let id=null; try{ const r=await dcall('search_files',{query:q,excludeContentSnippets:true,pageSize:5}); id=r&&r.files&&r.files[0]&&r.files[0].id; }catch(e){ if(isAuthz(e)) throw e; }
-  if(!id){ const f=await dcall('create_file',{title:cat,parentId:DRIVE.root,contentMimeType:'application/vnd.google-apps.folder'}); id=f&&f.id; }
-  if(!id) throw {code:'tool_error',message:'No se pudo crear la carpeta '+cat};
-  S.folders[cat]=id; save(); return id;
-}
+  if(!id){ const f=await dcall('create_file',{title,parentId:parent,contentMimeType:'application/vnd.google-apps.folder'}); id=f&&f.id; }
+  if(!id) throw {code:'tool_error',message:'No se pudo crear la carpeta '+title};
+  return id; }
+async function ensureFolder(p){
+  if(!p) return DRIVE.otros;
+  const ck='c:'+p.cat; let cid=S.folders[ck];
+  if(!cid){ const old=DRIVE.cats[p.cat]; const nm=catFolderName(p.cat);
+    if(old){ try{ await dcall('update_file',{fileId:old,title:nm}); cid=old; }catch(e){ if(isAuthz(e)) throw e; cid=null; } }
+    if(!cid) cid=await findOrMake(nm,DRIVE.root);
+    S.folders[ck]=cid; save(); }
+  const pk='p:'+p.id; if(S.folders[pk]) return S.folders[pk];
+  const pid=await findOrMake(partFolderName(p),cid); S.folders[pk]=pid; save(); return pid; }
 const isAuthz = e => e && ['needs_reauth','server_not_connected','not_in_manifest','blocked_by_policy','approval_required','not_granted','capability_disabled','selection_required'].includes(e.code);
 function recTitle(m,r,ext){ const H=HOL[m.from]?HOL[m.from].n:''; const d=(m.desc||TYPES[m.type].n).replace(/[\\/:*?"<>|#\n]+/g,' ').replace(/\s+/g,' ').trim().slice(0,48);
   return `${m.ts.slice(0,10)} · ${fmt(m.amt)} · ${d}${H?' · '+H:''} · ${r.id}.${ext}`; }
@@ -553,12 +572,12 @@ async function syncDrive(){
   let fileArgs=false; try{ const lt=await CAP.mcp.listTools(); fileArgs=!!lt.fileArgs; }catch(e){}
   DSYNC={busy:true,done:0,total:list.length,last:null}; render();
   const res={up:0,had:0,fail:[]}; let stop=null;
-  for(const {r,m} of list){
+  for(const {r,m,p} of list){
     try{
-      const cat=recCat(m); const folder=await ensureFolder(cat);
+      const cat=recPath(p); const folder=await ensureFolder(p);
       // ¿ya existe en Drive? (evita duplicados aunque se haya subido desde otro teléfono)
       let found=null; try{ const sr=await dcall('search_files',{query:`title contains '${r.id}' and trashed = false`,excludeContentSnippets:true,pageSize:2}); found=sr&&sr.files&&sr.files[0]; }catch(e){ if(isAuthz(e)) throw e; }
-      if(found){ S.recUp[r.id]={id:found.id,url:found.viewUrl||'',cat:cat||'Otros movimientos',at:Date.now()}; res.had++; }
+      if(found){ S.recUp[r.id]={id:found.id,url:found.viewUrl||'',cat,fp:p?p.id:'',at:Date.now()}; res.had++; if(p&&found.parentId&&found.parentId!==folder){ try{ await dcall('update_file',{fileId:found.id,parentId:folder}); }catch(e){ if(isAuthz(e)) throw e; } } }
       else {
         const data=await RDB.get(r.id); if(!data) throw {code:'local',message:'El archivo no está en este teléfono'};
         const mime=(data.match(/^data:([^;]+);/)||[])[1]||'image/jpeg'; const b64=data.slice(data.indexOf(',')+1); const ext=mime==='application/pdf'?'pdf':(mime.split('/')[1]||'jpg').replace('jpeg','jpg');
@@ -566,7 +585,7 @@ async function syncDrive(){
         if(b64.length>950000){ if(!fileArgs) throw {code:'local',message:'Archivo muy pesado para subir desde aquí'}; const blob=await (await fetch(data)).blob(); input.base64Content={$file:{data:blob,name:'recibo.'+ext,type:mime}}; }
         else input.base64Content=b64;
         const f=await dcall('create_file',input);
-        S.recUp[r.id]={id:f&&f.id,url:(f&&f.viewUrl)||'',cat:cat||'Otros movimientos',at:Date.now()}; res.up++;
+        S.recUp[r.id]={id:f&&f.id,url:(f&&f.viewUrl)||'',cat,fp:p?p.id:'',at:Date.now()}; res.up++;
       }
       save();
     }catch(e){
@@ -587,13 +606,37 @@ async function syncDrive(){
     ${res.fail.length?`<div class="blockh">No se subieron</div><div class="list">${res.fail.map(f=>`<div class="li"><div class="m"><b>${esc(f.name)}</b><small>${esc(f.amb?'No hubo respuesta clara de Drive. Al volver a tocar el botón reviso si quedó subido antes de repetir.':f.msg)}</small></div></div>`).join('')}</div>`:''}
     <a class="btn" style="margin-top:16px;width:100%" href="${DRIVE.url}" target="_blank" rel="noopener">${ico('file')}Abrir la carpeta de recibos en Drive</a>`);
 }
+async function reorgDrive(){
+  if(DSYNC.busy) return; if(!CAP.mcp){ toast('Abre la app dentro de Claude para ordenar Drive'); return; }
+  const todo=allRecibos().filter(x=>S.recUp[x.r.id]&&S.recUp[x.r.id].id&&(S.recUp[x.r.id].fp||'')!==(x.p?x.p.id:''));
+  if(!todo.length){ toast('Las carpetas ya están en orden'); return; }
+  DSYNC={busy:true,done:0,total:todo.length,last:null}; render(); let ok=0,stop=null,bad=0;
+  for(const {r,p} of todo){ try{ const folder=await ensureFolder(p); await dcall('update_file',{fileId:S.recUp[r.id].id,parentId:folder}); S.recUp[r.id].fp=p?p.id:''; S.recUp[r.id].cat=recPath(p); ok++; save(); }catch(e){ if(isAuthz(e)){ stop=e; break; } bad++; } DSYNC.done++; render(); }
+  DSYNC.busy=false; save(); render(); toast(stop?'No se pudo seguir: revisa la conexión con Drive':`Ordenados ${ok} recibo${ok===1?'':'s'}${bad?` · ${bad} con error`:''}`); }
+function crc32(u){ let c,t=crc32.t; if(!t){ t=crc32.t=[]; for(let n=0;n<256;n++){ c=n; for(let k=0;k<8;k++) c=c&1?0xEDB88320^(c>>>1):c>>>1; t[n]=c>>>0; } } let r=-1; for(let i=0;i<u.length;i++) r=t[(r^u[i])&255]^(r>>>8); return (r^-1)>>>0; }
+function makeZip(files){ const enc=new TextEncoder(), parts=[], cd=[]; let off=0; const dt=new Date(); const dd=((dt.getFullYear()-1980)<<9)|((dt.getMonth()+1)<<5)|dt.getDate(), tt=(dt.getHours()<<11)|(dt.getMinutes()<<5)|(dt.getSeconds()>>1);
+  for(const f of files){ const nm=enc.encode(f.name), crc=crc32(f.data), h=new DataView(new ArrayBuffer(30)); h.setUint32(0,0x04034b50,true); h.setUint16(4,20,true); h.setUint16(6,0x0800,true); h.setUint16(8,0,true); h.setUint16(10,tt,true); h.setUint16(12,dd,true); h.setUint32(14,crc,true); h.setUint32(18,f.data.length,true); h.setUint32(22,f.data.length,true); h.setUint16(26,nm.length,true); h.setUint16(28,0,true);
+    parts.push(h.buffer,nm,f.data); const c=new DataView(new ArrayBuffer(46)); c.setUint32(0,0x02014b50,true); c.setUint16(4,20,true); c.setUint16(6,20,true); c.setUint16(8,0x0800,true); c.setUint16(10,0,true); c.setUint16(12,tt,true); c.setUint16(14,dd,true); c.setUint32(16,crc,true); c.setUint32(20,f.data.length,true); c.setUint32(24,f.data.length,true); c.setUint16(28,nm.length,true); c.setUint32(42,off,true); cd.push(c.buffer,nm); off+=30+nm.length+f.data.length; }
+  const cdl=cd.reduce((n,x)=>n+(x.byteLength||x.length),0), e=new DataView(new ArrayBuffer(22)); e.setUint32(0,0x06054b50,true); e.setUint16(8,files.length,true); e.setUint16(10,files.length,true); e.setUint32(12,cdl,true); e.setUint32(16,off,true);
+  return new Blob([...parts,...cd,e.buffer],{type:'application/zip'}); }
+async function zipRecibos(){
+  const list=allRecibos(); if(!list.length){ toast('Todavía no hay recibos registrados'); return; }
+  const files=[]; let miss=0;
+  for(const {r,m,p} of list){ const data=await RDB.get(r.id); if(!data){ miss++; continue; }
+    const mime=(data.match(/^data:([^;]+);/)||[])[1]||'image/jpeg'; const ext=mime==='application/pdf'?'pdf':(mime.split('/')[1]||'jpg').replace('jpeg','jpg');
+    const bin=atob(data.slice(data.indexOf(',')+1)), u=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i);
+    files.push({name:recPath(p)+'/'+recTitle(m,r,ext),data:u}); }
+  if(!files.length){ toast('Los archivos no están en este teléfono'); return; }
+  const a=document.createElement('a'); a.href=URL.createObjectURL(makeZip(files)); a.download='Recibos-Choco-2026.zip'; document.body.appendChild(a); a.click(); setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); },4000);
+  toast(`ZIP con ${files.length} recibo${files.length===1?'':'s'}${miss?` · ${miss} sin archivo aquí`:''}`); }
 function driveCard_(compact){
   const n=pendingRecibos().length, w=waitingRecibos(); const up=Object.keys(S.recUp).length;
   const btn=`<button class="btn ${n?'teal':''} ${compact?'':'sm'}" onclick="syncDrive()" ${DSYNC.busy?'disabled':''}>${ico('refresh')}${DSYNC.busy?`Subiendo ${DSYNC.done}/${DSYNC.total}…`:(n?`Subir ${n} recibo${n>1?'s':''} a Drive`:'Revisar recibos en Drive')}</button>`;
   if(compact) return btn;
-  return `<div class="card"><div class="h2">Recibos en Drive</div><p class="sub" style="margin-top:6px">Se guardan en "Recibos · Compras Chocó 2026", en una carpeta por categoría de gasto (las nuevas se crean solas). Nunca se suben dos veces.</p>
+  return `<div class="card"><div class="h2">Recibos en Drive</div><p class="sub" style="margin-top:6px">Se guardan en "Recibos · Compras Chocó 2026", en una carpeta por categoría y una subcarpeta por partida, en el mismo orden de Finanzas. Cada recibo se sube una sola vez, aunque cubra varias compras.</p>
    <dl class="kv" style="margin-top:12px"><dt>En Drive</dt><dd>${up}</dd><dt>Por subir</dt><dd>${n}</dd>${w?`<dt>Esperan registro</dt><dd>${w} (compras de Quibdó sin pasar a Finanzas)</dd>`:''}<dt>Última subida</dt><dd>${S.driveAt?new Date(S.driveAt).toLocaleString('es-CO',{day:'numeric',month:'short',hour:'numeric',minute:'2-digit'}):'—'}</dd></dl>
    <div class="row" style="margin-top:14px">${btn}<a class="btn sm ghost" href="${DRIVE.url}" target="_blank" rel="noopener">Abrir carpeta ${ico('chev')}</a></div>
+   <div class="row" style="margin-top:10px"><button class="btn sm ghost" onclick="reorgDrive()" ${DSYNC.busy?'disabled':''}>Ordenar lo ya subido</button><button class="btn sm ghost" onclick="zipRecibos()">Descargar ZIP por partida</button></div>
    ${!CAP.mcp?'<div class="hint" style="margin-top:10px">El botón funciona con la app abierta dentro de Claude y con señal.</div>':''}</div>`;
 }
 
